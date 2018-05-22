@@ -11,6 +11,7 @@
 #include <linux/of.h>   //of_match_ptr()
 #include <linux/platform_device.h> // struct platform_driver platform_device() platform_get_resource()
 #include <linux/uaccess.h> // copy_to_user() copy_from_user()
+#include <linux/interrupt.h>
 
 #include "spi-srz.h" //Фнукции и регистры контроллера SPI Designware 
 #include "fifo.h"
@@ -19,7 +20,6 @@
 #define SPI_MAJOR 159
 #define SPI_MINOR 0
 #define SRZ_SPI_NAME "spisrz"
-#define buf_depth 2048;
 
 //********************************************************************************
 struct srz_spi_mmio {
@@ -32,6 +32,7 @@ static dev_t spi_num;
 static struct class *dev_class;
 static struct file_operations spisrz_fops;
 static struct srz_spi *srz;
+static struct fifo *pspififo;
 //********************************************************************************
 static inline u32 srz_reg_read(struct srz_spi *srz, u32 offset){
     return readl_relaxed(srz->regs+offset);
@@ -47,145 +48,66 @@ static inline void srz_data_write(struct srz_spi *srz, u32 offset, u8 val){
 }
 //***********************************MODULE SPI SLAVE*****************************
 static int spisrz_open(struct inode *inode, struct file *spi_filp){
-    FIFO(2048) *rx_buf, *tx_buf;
-    pdata = kmalloc(sizeof(struct data_buffer),GFP_KERNEL);
-    if (!pdata)
-        return -ENOMEM; 
-    pdata->rx_rd = 0;
-    pdata->rx_wr = 0;
-    pdata->tx_rd = 0;
-    pdata->tx_wr = 0;
-    pdata->rx_empty = 1;
-    pdata->tx_empty = 1;
-    pdata->rx_full  = 0;
-    pdata->tx_full  = 0;
-
-    spi_filp->private_data = pdata;
+    spi_filp->private_data = pspififo;
     srz_reg_write(srz, DW_SPI_SPIENR, 1);
 	return SUCCESS;
 }
 static int spisrz_close(struct inode *inode, struct file *spi_filp){
-    kfree(spi_filp->private_data);
 	return SUCCESS;
 }
 static ssize_t spisrz_read(struct file *spi_filp, char __user *buff, size_t count,loff_t *offp){
-    struct data_buffer *pdata = spi_filp->private_data;
-    u16 addr_wr = pdata->rx_wr;
-    u16 addr_rd = pdata->rx_rd;
-
-
-    while (srz_reg_read(srz,DW_SPI_SR) & SR_RF_NOT_EMPT){        
-        (pdata->buf_rd+addr_wr) = srz_data_read(srz, DW_SPI_DR);
-        if (addr_wr!=buf_depth-1)
-            addr_wr++;
-        else
-            addr_wr = 0;    
-    }
-    pdata->rx_wr = addr_wr;
-
-    if (addr_rd+count<addr_wr){
-        data->rx_rd = addr_rd+count;
-        if (copy_to_user(buff, (pdata->buf_rd+addr_rd), count))
-            return -EFAULT;
-        return count;      
-    }
-    if (addr_rd<addr_wr && addr_rd+count>addr_wr){
-        data->rx_rd = addr_wr;
-        if (copy_to_user(buff, (pdata->buf_rd+addr_rd), addr_wr-addr_rd))
-            return -EFAULT;
-        return (addr_wr-addr_rd);
-    }
-
-    if (addr_rd>addr_wr && (addr_rd+count)%buf_depth>addr_wr)
-        data->rx_rd = addr_rd+count;
-        if (copy_to_user(buff, (pdata->buf_rd+addr_rd), count))
-            return -EFAULT;
-        return count;      
-    }
-
-    if (addr_rd>addr_wr && (addr_rd+count)%buf_depth<addr_wr)
-
-
-        
-
-
-    if (count>count_wr)
+    struct fifo *pdata = spi_filp->private_data;
+    u8 data[FIFO_SIZE];
+    u32 i;
+    if (count>FIFO_SIZE){
+        printk("SPI Slave rx count > FIFO_SIZE\n");
         return 0;
-    else
-        status=copy_to_user(buff, pdata->buf_rd, count);
-    if (copy_to_user(buff, pdata->buf_rd, count))
-        return -EFAULT;
-    return 
-    // for (count_wr = pdata->rx_wr;i<count;i++){
-    //     if(srz_reg_read(srz,DW_SPI_SR) & SR_RF_NOT_EMPT)
-    //         *(data+i) = srz_data_read(srz, DW_SPI_DR);
-    //     else
-    //         return 1;
-    // }
-
-
-
-
-
-
-
-
-
-
-
-    if (pdata->rx_empty)
-        return 0;
-    for (prd=0;prd<count;prd++){
-        if (pdata->rx_rd=pdata->rx_wr)
-            return(count-prd);
-        if (pdata->rx_rd<pdata->rx_wr)
-
     }
-    if (pdata->rx_rd<pdata->rx_wr){
-
+    
+    while (srz_reg_read(srz,DW_SPI_SR) & SR_RF_NOT_EMPT){
+        if (!fifo_rx_is_full(pdata))
+            fifo_rx_write(pdata, srz_data_read(srz, DW_SPI_DR));
+        else{
+            printk("SPI Slave FIFO RX is overflow.\n");
+            return 0;
+        }
     }
 
-
-    u8 data[256];
-    u8 i=0;
-    ssize_t status;
     for (i=0;i<count;i++){
-        if(srz_reg_read(srz,DW_SPI_SR) & SR_RF_NOT_EMPT)
-            *(data+i) = srz_data_read(srz, DW_SPI_DR);
-        else
-            return 1;
+        if (!fifo_rx_is_empty(pdata)) 
+            *(data+i)=fifo_rx_read(pdata);
+        else{
+            printk("SPI Slave FIFO RX is empty.\n");
+            break;
+        }
     }
-	status=copy_to_user(buff, data, count);
-	return status;
+    if (copy_to_user(buff, data, i))
+        return -EFAULT;
+    return i;
 }
 static ssize_t spisrz_write(struct file *spi_filp, const char __user *buff, size_t count,loff_t *offp){
-    u8 data[256];
-    u8 i=0;
-    ssize_t status;
-	status = copy_from_user(data, buff, count);
-    for (i=0;i<count;i++){
-        if(srz_reg_read(srz,DW_SPI_SR) & SR_TF_NOT_FULL)
-            srz_data_write(srz, DW_SPI_DR, data[i]);
-        else
-            return 1;
+    struct fifo *pdata = spi_filp->private_data;
+    u8 data[FIFO_SIZE];
+    u32 i=0;
+    if (count>FIFO_SIZE){
+        printk("SPI Slave tx count > FIFO_SIZE\n");
+        return 0;
     }
-	return status;
+    printk("+++ spisrz write pointer data: %.8X", (u32)pdata);
+    i=copy_from_user(data, buff, count);
+    for (i=0;i<count;i++){
+        if (!fifo_tx_is_full(pdata))
+            fifo_tx_write(pdata, data[i]);
+        else{
+            printk("SPI Slave FIFO TX is overflow.\n");
+            break;
+        }
+    }
+    srz_reg_write(srz, DW_SPI_IMR, srz_reg_read(srz, DW_SPI_IMR) | SPI_INT_TXEI);
+    return i;
 }
 static long spisrz_ioctl(struct file *spi_filp, unsigned int cmd, unsigned long arg){
 	printk(KERN_ALERT "+++ Driver: ioctl()\n");
-
-    // if (_IOC_TYPE(cmd) != SRZ_IOC_MAGIC) return -ENOTTY;
-    // switch (cmd){
-    //     case SPI_ENABLE_IOC:
-              
-    //         printk(KERN_ALERT "spisrz slave enable\n");
-    //         break;
-    //     case SPI_CONFIG_IOC:
-    //         srz_reg_write(srz, DW_SPI_CTRL0, (u32) *arg);
-    //         srz_reg_write(srz, DW_SPI_SPIENR, (u32) *(arg+1);
-
-
-    // }
 	return SUCCESS;
 }
 //********************************************************************************
@@ -197,12 +119,62 @@ static struct file_operations spisrz_fops = {
 	.unlocked_ioctl = spisrz_ioctl,
 	.release = spisrz_close,
 };
+//*************************Обработчик прерывания**********************************
+static irqreturn_t spisrz_irq(int irq, void *dev_id){
+    struct fifo *pdata = dev_id;
+    u32 flag;
+    u8 master_on;
+    flag = srz_reg_read(srz,DW_SPI_ISR);
+    printk(KERN_ALERT "+++ Interrupt SPI slave, status interrupt: %.8X\n", flag);
+    if (flag & SPI_INT_TXEI){//Если буфер передачи пуст
+        printk(KERN_ALERT "+++ Interrupt TX empty\n");
+        if (fifo_tx_is_empty(pdata)){
+            printk(KERN_ALERT "+++ Interrupt fifo_tx_is_empty\n");
+            master_on = 0;
+            srz_reg_write(srz, DW_SPI_IMR, srz_reg_read(srz,DW_SPI_IMR) & ~SPI_INT_TXEI);
+            return IRQ_HANDLED;
+        }
+        else{
+            printk(KERN_ALERT "+++ Interrupt fifo_tx_not_empty\n");
+            while(srz_reg_read(srz,DW_SPI_SR) & SR_TF_NOT_FULL){
+                if (!fifo_tx_is_empty(pdata))
+                    srz_data_write(srz, DW_SPI_DR, fifo_tx_read(pdata));
+                else 
+                    return IRQ_HANDLED;
+            }
+        }
+    }
+    if (flag & SPI_INT_RXFI){//Если буфер приема полон
+        printk(KERN_ALERT "+++ Interrupt RX full\n");
+        while (srz_reg_read(srz,DW_SPI_SR) & SR_RF_NOT_EMPT){
+            if (!fifo_rx_is_full(pdata)){
+                printk(KERN_ALERT "+++ Interrupt fifo_rx_not_full\n");
+                fifo_rx_write(pdata, srz_data_read(srz, DW_SPI_DR));
+            }
+            else{
+                printk("SPI Slave interrupt FIFO RX is overflow.\n");
+                srz_reg_write(srz, DW_SPI_IMR, srz_reg_read(srz,DW_SPI_IMR) & ~SPI_INT_RXFI);
+                return IRQ_HANDLED;
+            }
+        }
+    }
+
+    return IRQ_HANDLED;
+}
+// static int irq_counter;
+// static irqreturn_t my(int irq, void *dev_id){
+//     irq_counter++;
+//     printk(KERN_ALERT "ISR: counter = %d\n",irq_counter);
+//     return IRQ_NONE;
+// }
+//********************************************************************************
 //Определение устройства и его регистрация в файловой системе
 static int spisrz_probe(struct platform_device *pdev){
     struct srz_spi_mmio *srzmmio;        
     struct resource *res;
     int ret;
     //Создаем класс
+    printk(KERN_ALERT "+++ spi-slave probe hello\n");
     dev_class = class_create(THIS_MODULE, SRZ_SPI_NAME);
     if (IS_ERR(dev_class))
         return 1;
@@ -239,13 +211,40 @@ static int spisrz_probe(struct platform_device *pdev){
     if (IS_ERR(srzmmio->clk))
         return PTR_ERR(srzmmio->clk);
     
-	if (clk_prepare_enable(srzmmio->clk));
+    ret = clk_prepare_enable(srzmmio->clk);
+	if (ret)
 		return ret;
     //Читаем узлы дерева устройств
     srz->slave = device_property_read_bool(&pdev->dev, "spi-slave");
-    platform_set_drvdata(pdev, srzmmio);
-
+    //Разрешаем прерывания
     printk(KERN_ALERT "+++ spi-slave probe success\n");
+
+
+    pspififo = kmalloc(sizeof(struct fifo),GFP_KERNEL);
+    if (!pspififo)
+        return -ENOMEM;
+    fifo_rx_erase(pspififo);
+    fifo_tx_erase(pspififo);
+
+
+    ret = request_irq(srz->irq, spisrz_irq ,IRQF_SHARED, "spisrz", pspififo);
+    if (ret) {
+        printk(KERN_ALERT "can not get IRQ\n");
+    }
+    
+    printk("+++ irq num: %d", srz->irq);
+
+    platform_set_drvdata(pdev, srzmmio);
+    
+  //  if (request_irq(40, my, IRQF_SHARED, "my_interrup", &ret))
+    //    return -1;
+
+
+
+    srz_reg_write(srz, DW_SPI_IMR, SPI_INT_RXFI);
+
+    printk("+++ spisrz probe pointer data: %.8X, irq num: %d", (u32)pspififo, srz->irq);
+
 	return SUCCESS;
 
 	unreg:
@@ -258,6 +257,7 @@ static int spisrz_probe(struct platform_device *pdev){
 }
 static int spisrz_remove(struct platform_device *pdev){
     struct srz_spi_mmio *srzmmio = platform_get_drvdata(pdev);
+    kfree(pspififo);
 	clk_disable_unprepare(srzmmio->clk);
     device_destroy(dev_class,spi_num);
 	cdev_del(&spi_cdev);
